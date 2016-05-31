@@ -54,3 +54,5 @@ That way you can add ``/usr/local/bin`` to your ``PATH`` (if it isn't
 already there) and you can just invoke it directly, e.g.::
 
   $ crashlog /path/to/crash.log
+
+.. _LLDB: http://lldb.llvm.org
