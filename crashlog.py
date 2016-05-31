@@ -81,21 +81,26 @@ PARSE_MODE_THREAD = 1
 PARSE_MODE_IMAGES = 2
 PARSE_MODE_THREGS = 3
 PARSE_MODE_SYSTEM = 4
+PARSE_MODE_CALLGRAPH = 5
+PARSE_MODE_CGTHREAD = 6
 
 class CrashLog(symbolication.Symbolicator):
     """Class that does parses darwin crash logs"""
     parent_process_regex = re.compile('^Parent Process:\s*(.*)\[(\d+)\]');
     thread_state_regex = re.compile('^Thread ([0-9]+) crashed with')
     thread_regex = re.compile('^Thread ([0-9]+)([^:]*):(.*)')
+    cg_thread_regex = re.compile(r'^\s+\d+\s+Thread_(\d+)(?::?\s+(.*))?')
     app_backtrace_regex = re.compile('^Application Specific Backtrace ([0-9]+)([^:]*):(.*)')
     frame_regex = re.compile('^([0-9]+)\s+(\S+)\s+(0x[0-9a-fA-F]+) +(.*)')
+    cg_frame_regex = re.compile(r'^(\s+(?:[+!:|]\s+)*)(\d+)\s+(.+)\s+\(in (\S+)\)\s+([^[]+)\[(0x[0-9a-fA-F]+)[,\]]')
     image_regex_uuid = re.compile('(0x[0-9a-fA-F]+)[- ]+(0x[0-9a-fA-F]+) +[+]?([^ ]+) +([^<]+)<([-0-9a-fA-F]+)> (.*)');
     image_regex_no_uuid = re.compile('(0x[0-9a-fA-F]+)[- ]+(0x[0-9a-fA-F]+) +[+]?([^ ]+) +([^/]+)/(.*)');
     empty_line_regex = re.compile('^$')
-        
+    sample_regex = re.compile(r'^Sample analysis of process \d+ written to file')
+    
     class Thread:
         """Class that represents a thread in a darwin crash log"""
-        def __init__(self, index, app_specific_backtrace):
+        def __init__(self, index, app_specific_backtrace, description=""):
             self.index = index
             self.frames = list()
             self.idents = list()
@@ -103,12 +108,14 @@ class CrashLog(symbolication.Symbolicator):
             self.reason = None
             self.queue = None
             self.app_specific_backtrace = app_specific_backtrace
-        
+            self.description = description
+            
         def dump(self, prefix):
             if self.app_specific_backtrace:
-                print "%Application Specific Backtrace[%u] %s" % (prefix, self.index, self.reason)
+                print "%Application Specific Backtrace[%u] %s %s" % (prefix, self.index, self.reason, self.description)
             else:
-                print "%sThread[%u] %s" % (prefix, self.index, self.reason)
+                print "%sThread[%u] %s %s" % (prefix, self.index, self.reason,
+                                              self.description)
             if self.frames:
                 print "%s  Frames:" % (prefix)
                 for frame in self.frames:
@@ -140,7 +147,7 @@ class CrashLog(symbolication.Symbolicator):
                     symbolicated_frame_address_idx = 0
                     for symbolicated_frame_address in symbolicated_frame_addresses:
                         display_frame_idx += 1
-                        print '[%3u] %s' % (frame_idx, symbolicated_frame_address)
+                        print frame.format_symbolicated(symbolicated_frame_address)
                         if (options.source_all or self.did_crash()) and display_frame_idx < options.source_frames and options.source_context:
                             source_context = options.source_context
                             line_entry = symbolicated_frame_address.get_symbol_context().line_entry
@@ -183,6 +190,8 @@ class CrashLog(symbolication.Symbolicator):
                 s = "Thread[%u]" % self.index
             if self.reason:
                 s += ' %s' % self.reason
+            if self.description:
+                s += ' %s' % self.description
             return s
         
     
@@ -192,16 +201,41 @@ class CrashLog(symbolication.Symbolicator):
             self.pc = pc
             self.description = description
             self.index = index
-        
+
         def __str__(self):
             if self.description:
                 return "[%3u] 0x%16.16x %s" % (self.index, self.pc, self.description)
             else:
                 return "[%3u] 0x%16.16x" % (self.index, self.pc)
 
+        def format_symbolicated(self, symbolicated_frame_address):
+            return '[%3u] %s' % (self.index, symbolicated_frame_address)
+            
         def dump(self, prefix):
             print "%s%s" % (prefix, str(self))
-    
+
+    class CallGraphFrame:
+        """Class that represents a call graph frame in a thread in a darwin sample"""
+        def __init__(self, count, pc, indent, description):
+            self.pc = pc
+            self.count = count
+            self.indent = indent
+            self.description = description
+
+        def __str__(self):
+            if self.description:
+                return '%s %u 0x%16.16x %s' % (self.indent, self.count,
+                                               self.pc, self.description)
+            else:
+                return '%s %u 0x%16.16x' % (self.indent, self.count, self.pc)
+
+        def format_symbolicated(self, symbolicated_frame_address):
+            return '%s %u %s' % (self.indent, self.count,
+                                 symbolicated_frame_address)
+            
+        def dump(self, prefix):
+            print '%s%s' % (prefix, str(self))
+            
     class DarwinImage(symbolication.Image):
         """Class that represents a binary images in a darwin crash log"""
         dsymForUUIDBinary = os.environ.get('DSYMFORUUID', None)
@@ -432,6 +466,8 @@ class CrashLog(symbolication.Symbolicator):
                             self.backtraces.append(thread)
                         else:
                             self.threads.append(thread)
+                    elif parse_mode == PARSE_MODE_CGTHREAD:
+                        self.threads.append(thread)
                     thread = None
                 else:
                     # only append an extra empty line if the previous line 
@@ -510,6 +546,9 @@ class CrashLog(symbolication.Symbolicator):
                         app_specific_backtrace = True
                         idx = int(app_backtrace_match.group(1))
                         thread = CrashLog.Thread(idx, True)
+                elif line.startswith('Call graph:'):
+                    parse_mode = PARSE_MODE_CALLGRAPH
+                    continue
                 self.info_lines.append(line.strip())
             elif parse_mode == PARSE_MODE_THREAD:
                 if line.startswith ('Thread'):
@@ -543,6 +582,9 @@ class CrashLog(symbolication.Symbolicator):
                                                       None,
                                                       image_match.group(5))
                         self.images.append (image)
+                    elif self.sample_regex.match(line):
+                        # This happens at the end of a sample
+                        parse_mode = PARSE_MODE_NORMAL
                     else:
                         print "error: image regex failed for: %s" % line
 
@@ -558,6 +600,34 @@ class CrashLog(symbolication.Symbolicator):
                     thread.registers[reg.strip()] = int(value, 0)
             elif parse_mode == PARSE_MODE_SYSTEM:
                 self.system_profile.append(line)
+            elif parse_mode == PARSE_MODE_CALLGRAPH \
+              or parse_mode == PARSE_MODE_CGTHREAD:
+                thread_match = self.cg_thread_regex.search (line)
+                if thread_match:
+                    if thread:
+                        self.threads.append(thread)
+                    parse_mode = PARSE_MODE_CGTHREAD
+                    thread_idx = int(thread_match.group(1))
+                    thread_desc = thread_match.group(2)
+                    if thread_desc is None:
+                        thread_desc = ""
+                    thread_desc = thread_desc.strip()
+                    thread = CrashLog.Thread(thread_idx, False, thread_desc)
+                    continue
+                if parse_mode == PARSE_MODE_CGTHREAD:
+                    frame_match = self.cg_frame_regex.match(line)
+                    if frame_match:
+                        ident = frame_match.group(4)
+                        thread.add_ident(ident)
+                        if not ident in self.idents:
+                            self.idents.append(ident)
+                        thread.frames.append(CrashLog.CallGraphFrame(int(frame_match.group(2)),
+                                                                     int(frame_match.group(6), 0),
+                                                                     frame_match.group(1),
+                                                            frame_match.group(3) + frame_match.group(5)))
+                    else:
+                        print 'error: call graph frame regex failed for line "%s"' % line
+                    
         f.close()
     
     def dump(self):
