@@ -41,6 +41,7 @@ import string
 import sys
 import time
 import uuid
+import subprocess
 
 try: 
     # Just try for LLDB in case PYTHONPATH is already correctly setup
@@ -87,7 +88,7 @@ class CrashLog(symbolication.Symbolicator):
     thread_state_regex = re.compile('^Thread ([0-9]+) crashed with')
     thread_regex = re.compile('^Thread ([0-9]+)([^:]*):(.*)')
     app_backtrace_regex = re.compile('^Application Specific Backtrace ([0-9]+)([^:]*):(.*)')
-    frame_regex = re.compile('^([0-9]+)\s+([^ ]+)\s+(0x[0-9a-fA-F]+) +(.*)')
+    frame_regex = re.compile('^([0-9]+)\s+(\S+)\s+(0x[0-9a-fA-F]+) +(.*)')
     image_regex_uuid = re.compile('(0x[0-9a-fA-F]+)[- ]+(0x[0-9a-fA-F]+) +[+]?([^ ]+) +([^<]+)<([-0-9a-fA-F]+)> (.*)');
     image_regex_no_uuid = re.compile('(0x[0-9a-fA-F]+)[- ]+(0x[0-9a-fA-F]+) +[+]?([^ ]+) +([^/]+)/(.*)');
     empty_line_regex = re.compile('^$')
@@ -203,18 +204,149 @@ class CrashLog(symbolication.Symbolicator):
     
     class DarwinImage(symbolication.Image):
         """Class that represents a binary images in a darwin crash log"""
-        dsymForUUIDBinary = os.path.expanduser('~rc/bin/dsymForUUID')
-        if not os.path.exists(dsymForUUIDBinary):
-            dsymForUUIDBinary = commands.getoutput('which dsymForUUID')
+        dsymForUUIDBinary = os.environ.get('DSYMFORUUID', None)
             
         dwarfdump_uuid_regex = re.compile('UUID: ([-0-9a-fA-F]+) \(([^\(]+)\) .*')
         
         def __init__(self, text_addr_lo, text_addr_hi, identifier, version, uuid, path):
             symbolication.Image.__init__(self, path, uuid);
-            self.add_section (symbolication.Section(text_addr_lo, text_addr_hi, "__TEXT"))
+
+            # Try to work out the slide, if possible; otherwise just hack
+            tb = self.get_text_base()
+            if tb is not None:
+                self.slide = text_addr_lo - tb
+            else:
+                self.add_section (symbolication.Section(text_addr_lo,
+                                                        text_addr_hi,
+                                                        "__TEXT"))
+                
             self.identifier = identifier
             self.version = version
+
+        _cmd_regex = re.compile(r'^\s+cmd\s+LC_SEGMENT')
+        _segname_regex = re.compile(r'^\s+segname\s+(.*)$')
+        _vmaddr_regex = re.compile(r'^\s+vmaddr\s+(0x[0-9a-fA-F]+)$')
+        def get_text_base(self):
+            if not os.path.exists(self.path):
+                return None
+            
+            otool = subprocess.Popen(['/usr/bin/otool',
+                                      '-l', self.path],
+                                      stdout=subprocess.PIPE)
+            state = 'start'
+            for line in otool.stdout:
+                if state == 'start' and self._cmd_regex.match(line):
+                    state = 'segment'
+                elif state == 'segment':
+                    m = self._segname_regex.match(line)
+                    if m:
+                        if m.group(1) != '__TEXT':
+                            state = 'start'
+                        else:
+                            state = 'text'
+                elif state == 'text':
+                    m = self._vmaddr_regex.match(line)
+                    if m:
+                        return int(m.group(1),16)
+            otool.wait()
+            return None
         
+        _uuid_regex = re.compile(r'^[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}$')
+        _hex_regex = re.compile(r'^[0-9A-Fa-f]{32}$')
+
+        def canonicalise_uuid(self, uuid):
+            if self._uuid_regex.match(uuid):
+                return uuid.upper()
+            if self._hex_regex.match(uuid):
+                return '-'.join([uuid[0:8], uuid[8:12], uuid[12:16],
+                                uuid[16:20], uuid[20:]]).upper()
+            return None
+
+        _dduuid_regex = re.compile(r'^UUID: ([0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12})')
+        def uuid_from_path(self, path):
+            ddump = subprocess.Popen(['/usr/bin/dwarfdump',
+                                      '-u', path],
+                                      stdout=subprocess.PIPE)
+
+            ddline = ddump.stdout.readline().strip()
+            m = self._dduuid_regex.match(ddline)
+
+            if m:
+                return m.group(1)
+
+            return None
+
+        def find_dsym(self, uuid):
+            uuid = self.canonicalise_uuid(uuid)
+
+            if uuid is None:
+                return ''
+    
+            mdfind = subprocess.Popen(['/usr/bin/mdfind',
+                                      'com_apple_xcode_dsym_uuids=%s' % uuid],
+                                      stdout=subprocess.PIPE)
+    
+            path = mdfind.stdout.readline().strip()
+            executable = None
+    
+            if path.endswith('.xcarchive'):
+                for dsym in os.listdir(os.path.join(path, 'dSYMs')):
+                    if not dsym.endswith('.dSYM'):
+                        continue
+            
+                    dsym_path = os.path.join(path, 'dSYMs', dsym)
+
+                    if uuid == self.uuid_from_path(dsym_path):
+                        # Find the executable
+                        find = subprocess.Popen(['/usr/bin/find',
+                                                path,
+                                                '-perm', '+0111',
+                                                '-type', 'f'],
+                                                stdout=subprocess.PIPE)
+
+                        for line in find.stdout:
+                            line = line.strip()
+                            if uuid == self.uuid_from_path(line):
+                                executable = line
+                                break
+                    
+                        path = dsym_path
+                        break
+
+            return (path, executable)
+
+        def dsym_for_uuid(self, uuid):
+            """Find the dSYM and executable from the UUID.  Will use the
+            dsymForUUID script if it exists, otherwise uses a default
+            implementation."""
+            arch = None
+            symfile = None
+            path = None
+
+            if self.dsymForUUIDBinary is None \
+              or not os.path.exists(self.dsymForUUIDBinary):
+                symfile, path = self.find_dsym(uuid)
+            else:
+                dsu = subprocess.Popen([self.dsymForUUIDBinary, uuid],
+                                       stdout=subprocess.PIPE)
+
+                s = dsu.stdout.read()
+                dsu.wait()
+
+                if s:
+                    plist_root = plistlib.readPlistFromString (s)
+                    if plist_root:
+                        plist = plist_root[uuid]
+                        if plist:
+                            if 'DBGArchitecture' in plist:
+                                arch = plist['DBGArchitecture']
+                            if 'DBGDSYMPath' in plist:
+                                symfile = os.path.realpath(plist['DBGDSYMPath'])
+                            if 'DBGSymbolRichExecutable' in plist:
+                                path = os.path.expanduser (plist['DBGSymbolRichExecutable'])
+
+            return (arch, symfile, path)
+            
         def locate_module_and_debug_symbols(self):
             # Don't load a module twice...
             if self.resolved:
@@ -223,21 +355,14 @@ class CrashLog(symbolication.Symbolicator):
             self.resolved = True
             uuid_str = self.get_normalized_uuid_string()
             print 'Getting symbols for %s %s...' % (uuid_str, self.path),
-            if os.path.exists(self.dsymForUUIDBinary):
-                dsym_for_uuid_command = '%s %s' % (self.dsymForUUIDBinary, uuid_str)
-                s = commands.getoutput(dsym_for_uuid_command)
-                if s:
-                    plist_root = plistlib.readPlistFromString (s)
-                    if plist_root:
-                        plist = plist_root[uuid_str]
-                        if plist:
-                            if 'DBGArchitecture' in plist:
-                                self.arch = plist['DBGArchitecture']
-                            if 'DBGDSYMPath' in plist:
-                                self.symfile = os.path.realpath(plist['DBGDSYMPath'])
-                            if 'DBGSymbolRichExecutable' in plist:
-                                self.path = os.path.expanduser (plist['DBGSymbolRichExecutable'])
-                                self.resolved_path = self.path
+            arch, symfile, path = self.dsym_for_uuid(uuid_str)
+            if arch:
+                self.arch = arch
+            if symfile:
+                self.symfile = symfile
+            if path:
+                self.path = path
+                self.resolved_path = path
             if not self.resolved_path and os.path.exists(self.path):
                 dwarfdump_cmd_output = commands.getoutput('dwarfdump --uuid "%s"' % self.path)
                 self_uuid = self.get_uuid()
@@ -448,11 +573,24 @@ class CrashLog(symbolication.Symbolicator):
         for image in self.images:
             image.dump('  ')
     
+    def find_images_with_identifier(self, identifier):
+        images = list()
+        for image in self.images:
+            if image.identifier == identifier:
+                images.append(image)
+        if len(images) == 0:
+            regex_text = '^.*\.%s$' % (re.escape(identifier))
+            regex = re.compile(regex_text)
+            for image in self.images:
+                if regex.match(image.identifier):
+                    images.append(image)
+        return images
+
     def find_image_with_identifier(self, identifier):
         for image in self.images:
             if image.identifier == identifier:
                 return image            
-        regex_text = '^.*\.%s$' % (identifier)
+        regex_text = '^.*\.%s$' % (re.escape(identifier))
         regex = re.compile(regex_text)
         for image in self.images:
             if regex.match(image.identifier):
@@ -630,14 +768,13 @@ def save_crashlog(debugger, command, result, dict):
     if not out_file:
         result.PutCString ("error: failed to open file '%s' for writing...", args[0]);
         return
-    target = debugger.GetSelectedTarget()
-    if target:
-        identifier = target.executable.basename
+    if lldb.target:
+        identifier = lldb.target.executable.basename
         if lldb.process:
             pid = lldb.process.id
             if pid != lldb.LLDB_INVALID_PROCESS_ID:
                 out_file.write('Process:         %s [%u]\n' % (identifier, pid))
-        out_file.write('Path:            %s\n' % (target.executable.fullpath))
+        out_file.write('Path:            %s\n' % (lldb.target.executable.fullpath))
         out_file.write('Identifier:      %s\n' % (identifier))
         out_file.write('\nDate/Time:       %s\n' % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         out_file.write('OS Version:      Mac OS X %s (%s)\n' % (platform.mac_ver()[0], commands.getoutput('sysctl -n kern.osversion')));
@@ -674,10 +811,10 @@ def save_crashlog(debugger, command, result, dict):
                 out_file.write('\n')
                 
         out_file.write('\nBinary Images:\n')
-        for module in target.modules:
+        for module in lldb.target.modules:
             text_segment = module.section['__TEXT']
             if text_segment:
-                text_segment_load_addr = text_segment.GetLoadAddress(target)
+                text_segment_load_addr = text_segment.GetLoadAddress(lldb.target)
                 if text_segment_load_addr != lldb.LLDB_INVALID_ADDRESS:
                     text_segment_end_load_addr = text_segment_load_addr + text_segment.size
                     identifier = module.file.basename
